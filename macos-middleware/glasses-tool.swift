@@ -38,24 +38,21 @@ let CLR_RST    = "\u{001B}[0m"
 
 // ── Network helpers ────────────────────────────────────────────────────
 func getInterfaceIP(_ iface: String) -> String? {
-    var addrs: UnsafeMutablePointer<ifaddrs>? = nil
-    guard getifaddrs(&addrs) == 0 else { return nil }
-    defer { freeifaddrs(addrs) }
-    var ptr = addrs
-    while let p = ptr {
-        let name = String(cString: p.pointee.ifa_name)
-        if name == iface,
-           let sa = p.pointee.ifa_addr,
-           sa.pointee.sa_family == sa_family_t(AF_INET) {
-            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host,
-                           socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
-                return String(cString: host)
-            }
-        }
-        ptr = p.pointee.ifa_next
-    }
-    return nil
+    // Use ipconfig — reliable on macOS, handles all edge cases
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/sbin/ipconfig")
+    proc.arguments = ["getifaddr", iface]
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError  = FileHandle.nullDevice
+    guard (try? proc.run()) != nil else { return nil }
+    proc.waitUntilExit()
+    let ip = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    // Validate: must look like an IPv4 address
+    let parts = ip.split(separator: ".")
+    guard parts.count == 4, parts.allSatisfy({ UInt8($0) != nil }) else { return nil }
+    return ip
 }
 
 func log(_ msg: String, color: String = CLR_RST) {
@@ -905,15 +902,21 @@ print(psk.hex())
             case "connect":
                 // wifi connect auto  — use .env creds + en0 IP
                 // wifi connect <ssid> <pass> <ip>
-                if parts.count > 2 && parts[2] == "auto" {
+                if parts.count > 2 && String(parts[2]) == "auto" {
                     let ssid = config.wifiSSID.isEmpty ? wifiSSID : config.wifiSSID
                     let pass = config.wifiPSWD.isEmpty ? wifiPass : config.wifiPSWD
-                    let ip   = getInterfaceIP("en0") ?? getInterfaceIP("bridge100") ?? wifiGoIP
+                    let ip   = getInterfaceIP("en0") ?? getInterfaceIP("bridge100") ?? ""
                     guard !ssid.isEmpty, !pass.isEmpty else {
                         log("⚠️  No SSID/PSWD in .env. Use: wifi connect <ssid> <pass> <ip>", color: CLR_RED)
                         break
                     }
-                    log("🔑 Auto: SSID=\(ssid) IP=\(ip)", color: CLR_CYN)
+                    guard !ip.isEmpty else {
+                        log("⚠️  Could not detect en0/bridge100 IP.", color: CLR_RED)
+                        log("   Run: ipconfig getifaddr en0", color: CLR_YLW)
+                        log("   Then: wifi connect \(ssid) \(pass) <your-ip>", color: CLR_YLW)
+                        break
+                    }
+                    log("🔑 Auto: SSID=\(ssid)  IP=\(ip)", color: CLR_CYN)
                     wifiStartConnect(ssid: ssid, pass: pass, goIP: ip)
                 } else {
                     let ssid = parts.count > 2 ? String(parts[2]) : wifiSSID
