@@ -1335,33 +1335,89 @@ struct GlassesConfig {
 }
 
 // ── Auto-discover paired SmartEyeglass ───────────────────────────────────────
-func autoDiscoverGlasses() -> String? {
-    var candidates: [IOBluetoothDevice] = []
+func scanAndSelectGlasses() -> String? {
+    log("🔍 Scanning for SmartEyeglass... (10s — power on glasses now)", color: CLR_CYN)
+
+    var found: [IOBluetoothDevice] = []
+    var seen  = Set<String>()
+
+    // Seed with already-paired SmartEyeglass (show immediately)
+    let pairedAddrs: Set<String>
     if let paired = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] {
-        candidates = paired.filter { ($0.name ?? "").lowercased().contains("smarteyeglass") }
+        let glasses = paired.filter { ($0.name ?? "").lowercased().contains("smarteyeglass") }
+        for d in glasses {
+            let addr = d.addressString ?? ""
+            seen.insert(addr)
+            found.append(d)
+            log("  ★ \(d.name ?? "?")  [\(addr)]  (paired)", color: CLR_MAG)
+        }
+        pairedAddrs = Set(glasses.compactMap { $0.addressString })
+    } else {
+        pairedAddrs = []
     }
-    if candidates.isEmpty {
-        log("❌ No paired SmartEyeglass found.", color: CLR_RED)
-        log("   Power on glasses → System Settings → Bluetooth → pair", color: CLR_YLW)
-        log("   Then: ./glasses-tool scan   to verify", color: CLR_YLW)
+
+    // Live scan
+    let inquiry = IOBluetoothDeviceInquiry(delegate: nil)!
+    inquiry.inquiryLength = 8
+    inquiry.start()
+
+    var dots = 0
+    let deadline = Date().addingTimeInterval(10)
+    while Date() < deadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        dots += 1
+        if dots % 2 == 0 { print(".", terminator: ""); fflush(stdout) }
+
+        if let devices = inquiry.foundDevices() as? [IOBluetoothDevice] {
+            for d in devices {
+                let addr = d.addressString ?? ""
+                guard !seen.contains(addr) else { continue }
+                seen.insert(addr)
+                let name = d.name ?? ""
+                if name.lowercased().contains("smarteyeglass") {
+                    found.append(d)
+                    let tag = pairedAddrs.contains(addr) ? "paired" : "🔵 new"
+                    print("")
+                    log("  + \(name)  [\(addr)]  (\(tag))", color: CLR_GRN)
+                }
+            }
+        }
+    }
+    inquiry.stop()
+    print("")
+
+    guard !found.isEmpty else {
+        log("❌ No SmartEyeglass found.", color: CLR_RED)
+        log("   → Hold power switch 4+ sec to power on", color: CLR_YLW)
+        log("   → If new device: pair first via System Settings → Bluetooth", color: CLR_YLW)
+        log("   → Or: ./glasses-tool connect <address>  to connect directly (triggers pairing)", color: CLR_YLW)
         return nil
     }
-    if candidates.count == 1 {
-        let d = candidates[0]
-        log("🔍 Auto-selected: \(d.name ?? "?") [\(d.addressString ?? "?")]", color: CLR_GRN)
+
+    if found.count == 1 {
+        let d = found[0]
+        log("✅ Connecting to \(d.name ?? "?") [\(d.addressString ?? "?")]", color: CLR_GRN)
         return d.addressString
     }
+
     // Multiple — let user pick
-    log("🔍 Multiple SmartEyeglass found — pick one:", color: CLR_CYN)
-    for (i, d) in candidates.enumerated() {
-        log("  [\(i+1)] \(d.name ?? "?")  [\(d.addressString ?? "?")]", color: CLR_CYN)
+    print("")
+    log("Found \(found.count) glasses:", color: CLR_CYN)
+    let pairedList = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] ?? []
+    for (i, d) in found.enumerated() {
+        let addr  = d.addressString ?? ""
+        let isPaired = pairedList.contains { $0.addressString == addr }
+        let tag  = isPaired ? "\(CLR_MAG)(paired)\(CLR_RST)" : "\(CLR_GRN)(new — will pair)\(CLR_RST)"
+        log("  [\(i+1)] \(d.name ?? "?")  [\(addr)]  \(tag)", color: CLR_CYN)
     }
-    print("Enter number (default 1): ", terminator: ""); fflush(stdout)
-    if let line = readLine(), let n = Int(line.trimmingCharacters(in: .whitespaces)),
-       n >= 1, n <= candidates.count {
-        return candidates[n-1].addressString
+    print("\(CLR_YLW)Select [1-\(found.count)] (Enter = 1): \(CLR_RST)", terminator: "")
+    fflush(stdout)
+    if let line = readLine(),
+       let n = Int(line.trimmingCharacters(in: .whitespaces)),
+       n >= 1, n <= found.count {
+        return found[n-1].addressString
     }
-    return candidates[0].addressString
+    return found[0].addressString
 }
 
 let config = GlassesConfig.load()
@@ -1394,7 +1450,7 @@ func usage() {
 
 func resolveAddress(_ explicit: String?) -> String? {
     let addr = explicit ?? config.btAddress
-    if addr == "auto" || addr.isEmpty { return autoDiscoverGlasses() }
+    if addr == "auto" || addr.isEmpty { return scanAndSelectGlasses() }
     return addr
 }
 
