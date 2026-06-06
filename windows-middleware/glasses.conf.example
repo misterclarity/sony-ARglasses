@@ -1,0 +1,17 @@
+# Sony SED-E1 connection config (Windows)
+# Copy to glasses.conf and edit.
+
+# bt_address: MAC of your glasses (any of aa:bb:cc:dd:ee:ff / AC-9B-... / aabbccddeeff),
+#             or "auto" to discover a paired SmartEyeglass at startup.
+bt_address=auto
+# bt_address=aa:bb:cc:dd:ee:ff   # pin to a specific pair
+
+# rfcomm_channel: the SED-E1 data service ("AHA") lives on RFCOMM channel 4.
+rfcomm_channel=4
+
+# bt_name: device-name substring used to match the glasses during auto-discovery
+bt_name=SmartEyeglass
+
+# WiFi credentials (also readable from .env SSID= / PSWD=)
+# wifi_ssid=MyNetwork
+# wifi_pswd=MyPassword

@@ -1,0 +1,3 @@
+# No third-party dependencies - the Windows tool is pure Python standard library
+# (ctypes drives the Winsock AF_BTH Bluetooth socket; zlib/hashlib/socket are stdlib).
+# This file is intentionally empty. Requires Python 3.9+ on Windows.

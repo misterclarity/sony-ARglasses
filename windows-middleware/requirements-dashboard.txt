@@ -1,0 +1,8 @@
+# Optional extras for dashboard.py only (the CLI glasses_tool.py needs none of these).
+#   winsdk       - toggle the Windows Mobile Hotspot on/off for one-button WiFi
+#   sounddevice  - capture/play the glasses' Hands-Free microphone
+#   numpy        - audio buffer handling (sounddevice dependency)
+# Install:  pip install -r requirements-dashboard.txt
+winsdk>=1.0.0b10
+sounddevice>=0.4.6
+numpy>=1.24

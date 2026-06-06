@@ -34,3 +34,10 @@ macos-middleware/glasses-tool
 /tmp/
 __pycache__/
 progress.md
+
+# Python (Windows middleware)
+.venv/
+*.jsonl
+*.wav
+windows-middleware/glasses.conf
+_dbg.py
