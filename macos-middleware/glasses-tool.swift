@@ -349,6 +349,8 @@ func cmdConnect(address: String, channel: BluetoothRFCOMMChannelID = 0,
     var wifiServerFd: Int32 = -1
     var wifiClientFd: Int32 = -1
     var wifiSSID   = ""   // populated from .env SSID=
+    // Auto-upgrade BT→WiFi after phase5 when .env credentials are present
+    let autoWifi   = !config.wifiSSID.isEmpty && (getInterfaceIP("en0") != nil)
 
     // ── emitState helper ──────────────────────────────────────────────────────
     func emitState() {
@@ -482,7 +484,12 @@ func cmdConnect(address: String, channel: BluetoothRFCOMMChannelID = 0,
                 log("   Type 'wifi switch' to activate WiFi data path.", color: CLR_YLW)
                 wifiPhase = 12
                 emitState()
-                log("✅ Type 'wifi switch' to activate WiFi path.", color: CLR_YLW)
+                if autoWifi {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        log("🌐 Auto: switching to WiFi data path...", color: CLR_CYN)
+                        sendCmd([0x96, 0x00, 0x01, 0x01], label: "WifiDPSwitchPathReq(WIFI)")
+                    }
+                }
             }
 
             // Read loop — feed to same protocol handler as BT
@@ -736,6 +743,17 @@ print(psk.hex())
         """)
         print("\(CLR_MAG)> \(CLR_RST)", terminator: "")
         fflush(stdout)
+    }
+
+    // ── Auto WiFi upgrade
+    func triggerAutoWifi() {
+        guard autoWifi else { return }
+        log("🌐 Auto WiFi upgrade (SSID: \(config.wifiSSID))...", color: CLR_CYN)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            sendCmd([0x92, 0x00, 0x00], label: "WifiStatusTurnOnReq")
+            wifiPhase = 10
+            emitState()
+        }
     }
 
     // ── Ready banner ─────────────────────────────────────────────────────
@@ -1193,31 +1211,6 @@ print(psk.hex())
     }
 
 
-
-
-
-    // ── Glider demo ──────────────────────────────────────────────────────────
-    // 4 glider orientations (classic Conway glider, SE/SW/NE/NW)
-    let gliderShapes: [[(Int,Int)]] = [
-        [(1,0),(2,1),(0,2),(1,2),(2,2)],  // SE
-        [(1,0),(0,1),(0,2),(1,2),(2,2)],  // SW
-        [(1,2),(2,1),(0,0),(1,0),(2,0)],  // NE
-        [(1,2),(0,1),(0,0),(1,0),(2,0)],  // NW
-    ]
-    var gliderSpawnInterval: Double = 0
-    var gliderElapsed: Double = 0
-
-    func spawnGlider() {
-        let shape = gliderShapes[Int.random(in: 0..<4)]
-        let ox = Int.random(in: 5..<(W - 10))
-        let oy = Int.random(in: 5..<(H - 10))
-        for (dx, dy) in shape {
-            let x = ox + dx, y = oy + dy
-            if x >= 0 && x < W && y >= 0 && y < H { grid[y][x] = true }
-        }
-        log("🛸 Glider at (\(ox),\(oy))", color: CLR_MAG)
-    }
-
     // ── Gosper Glider Gun seed ────────────────────────────────────────────────
     // The canonical 36-cell pattern that continuously produces gliders.
     // Coordinates are (x,y) offsets from the gun's top-left corner.
@@ -1365,6 +1358,7 @@ print(psk.hex())
                 if gDisplayMode == .test { printREPLHelp() }
                 else { printReadyBanner() }
             }
+            if autoWifi { triggerAutoWifi() }
 
         case (4, 0x06):
             let level = data.count > 3 ? data[3] : 0
@@ -1380,6 +1374,7 @@ print(psk.hex())
                 if gDisplayMode == .test { printREPLHelp() }
                 else { printReadyBanner() }
             }
+            if autoWifi { triggerAutoWifi() }
 
         case (4, 0x81):
             log("✨ P4: FotaStatus (ignoring — waiting for LevelNotification)", color: CLR_YLW)
@@ -1402,7 +1397,13 @@ print(psk.hex())
                 wifiPhase = 11
                 emitEvent("WIFI", ["event": "ENABLED", "state": Int(status)])
                 emitState()
-                log("✅ Type 'wifi connect auto' to continue.", color: CLR_YLW)
+                if autoWifi {
+                    let ssid = config.wifiSSID; let pass = config.wifiPSWD
+                    let ip   = getInterfaceIP("en0") ?? ""
+                    guard !ip.isEmpty else { log("⚠️ Auto WiFi: no en0 IP", color: CLR_YLW); return }
+                    log("🌐 Auto: connecting to '\(ssid)'...", color: CLR_CYN)
+                    wifiStartConnect(ssid: ssid, pass: pass, goIP: ip)
+                }
             }
 
         case (_, 0x95): // WifiConnectivityStatus
@@ -1425,25 +1426,8 @@ print(psk.hex())
                 wifiActive = true; wifiPhase = 13
                 emitEvent("WIFI", ["event": "SWITCHED", "state": 13])
                 emitState()
-                log("🚀 WiFi data path ACTIVE — switching to 30fps glider demo!", color: CLR_GRN)
-                golTimer?.invalidate(); golTimer = nil
-                golInit()
-                spawnGlider()
-                gliderElapsed = 0
-                gliderSpawnInterval = Double.random(in: 4...10)
-                golSendFrame()
-                golTimer = Timer.scheduledTimer(withTimeInterval: 1.0/30.0, repeats: true) { _ in
-                    golStep(); golStep()
-                    gliderElapsed += 2.0/30.0
-                    if gliderElapsed >= gliderSpawnInterval {
-                        spawnGlider()
-                        gliderElapsed = 0
-                        gliderSpawnInterval = Double.random(in: 4...10)
-                    }
-                    golSendFrame()
-                }
-                RunLoop.current.add(golTimer!, forMode: .default)
-                log("🎮 30fps glider loop running over WiFi. Type 'stop' to stop.", color: CLR_MAG)
+                log("🚀 WiFi data path ACTIVE. Type 'glider' to start 30fps demo.", color: CLR_GRN)
+                printReadyBanner()
             } else {
                 wifiActive = false; wifiPhase = 0
                 emitState()
