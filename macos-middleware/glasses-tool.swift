@@ -1464,22 +1464,33 @@ func cmdProbe(address: String) {
 }
 
 // MARK: pair
-func cmdPairGuide(address: String? = nil) {
+func cmdPairGuide() {
+    // List currently paired SmartEyeglass devices so the user knows what's already known
+    let paired = (IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice]) ?? []
+    let glasses = paired.filter { ($0.name ?? "").lowercased().contains("smarteyeglass") }
+
     print("""
     \(CLR_CYN)
     ╔══════════════════════════════════════════════════════════╗
-    ║   Sony SED-E1 macOS Pairing Guide                       ║
+    ║   Sony SED-E1 — Pairing a new device                    ║
     ╠══════════════════════════════════════════════════════════╣
-    ║  1. Slide POWER switch, hold 4s → text on lenses        ║
-    ║  2. System Settings → Bluetooth → SmartEyeglass         ║
+    ║  1. Slide POWER switch, hold 4+ sec → text on lenses    ║
+    ║  2. System Settings → Bluetooth → find SmartEyeglass    ║
     ║     → Connect → tap touch sensor to confirm             ║
-    ║  3. ./glasses-tool sdp XX:XX:XX:XX:XX:XX               ║
-    ║  4. ./glasses-tool connect                              ║
+    ║  3. Run: ./glasses-tool                                  ║
+    ║     (auto-discovers any paired SmartEyeglass)            ║
     ╚══════════════════════════════════════════════════════════╝
     \(CLR_RST)
     """)
-    if let address = address {
-        cmdConnect(address: address, captureFile: "/tmp/glasses_capture.log")
+
+    if glasses.isEmpty {
+        log("No SmartEyeglass paired yet — follow steps above.", color: CLR_YLW)
+    } else {
+        log("Already paired (\(glasses.count)):", color: CLR_GRN)
+        for d in glasses {
+            log("  ● \(d.name ?? "?")  [\(d.addressString ?? "?")]", color: CLR_GRN)
+        }
+        log("Run \(CLR_GRN)./glasses-tool\(CLR_RST) to connect.", color: CLR_RST)
     }
 }
 
@@ -1680,6 +1691,9 @@ func scanAndSelectGlasses() -> String? {
 
 let config = GlassesConfig.load()
 
+// Suppress internal IOBluetooth / os_log framework chatter (e.g. initWithDelegate: 0x0)
+setenv("OS_ACTIVITY_MODE", "disable", 1)
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 let args = CommandLine.arguments
 
@@ -1718,10 +1732,10 @@ if args.count < 2 {
     cmdConnect(address: addr, channel: config.rfcommChannel, captureFile: config.captureLog)
 } else {
     switch args[1] {
-    case "scan":  cmdScan()
-    case "pair":  cmdPairGuide(address: resolveAddress(args.count > 2 ? args[2] : nil) ?? "")
-    case "sdp":   cmdSDP(address: resolveAddress(args.count > 2 ? args[2] : nil) ?? "")
-    case "probe": cmdProbe(address: resolveAddress(args.count > 2 ? args[2] : nil) ?? "")
+    case "scan":  cmdScan(); exit(0)
+    case "pair":  cmdPairGuide(); exit(0)
+    case "sdp":   cmdSDP(address: resolveAddress(args.count > 2 ? args[2] : nil) ?? ""); exit(0)
+    case "probe": cmdProbe(address: resolveAddress(args.count > 2 ? args[2] : nil) ?? ""); exit(0)
     case "connect":
         guard let addr = resolveAddress(args.count > 2 ? args[2] : nil) else { exit(1) }
         var ch = config.rfcommChannel
