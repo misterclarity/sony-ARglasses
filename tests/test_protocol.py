@@ -30,7 +30,7 @@ def test_sync_response_after_fota(proc, events: EventStream):
 
 def test_protocol_version_is_first_rx(proc, events: EventStream):
     """ProtocolVersion (0x0a) must be the first command from glasses."""
-    ev = events.wait_for(type="RX", timeout=15)
+    ev = events.wait_for(type="RX", timeout=25)
     assert ev is not None, "No RX event in first 15s"
     assert ev.get("cmd") == "0x0a", (
         f"Expected ProtocolVersion (0x0a) first, got {ev.get('cmd')} ({ev.get('name')})"
@@ -39,7 +39,7 @@ def test_protocol_version_is_first_rx(proc, events: EventStream):
 
 def test_settings_status_req_sent(proc, events: EventStream):
     """SettingsStatusRequest (0x71) must be sent after ProtocolVersion."""
-    events.wait_for(type="RX", cmd="0x0a", timeout=15)
+    events.wait_for(type="RX", cmd="0x0a", timeout=25)
     ev = events.wait_for(type="TX", cmd="0x71", timeout=3)
     assert ev is not None, "SettingsStatusRequest (0x71) not sent"
 

@@ -307,6 +307,7 @@ func cmdConnect(address: String, channel: BluetoothRFCOMMChannelID = 0,
 
     let name = device.name ?? address
     log("Connecting to \(name) [\(address)]...", color: CLR_CYN)
+    saveLastUsed(address)   // remember for next run (skips scan)
     gJSONLog = JSONEventLog(path: "/tmp/glasses-events.jsonl")
 
     device.performSDPQuery(nil)
@@ -593,25 +594,47 @@ print(psk.hex())
     }
 
     // ── Detect WiFi channel from macOS ────────────────────────────────────────
+    // airport -I is muted by macOS privacy in Ventura+; use system_profiler fallback.
+    // Returns the 2.4GHz MHz equivalent — glasses firmware is 2.4GHz only.
     func detectWifiChannel() -> Int {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        proc.arguments = ["bash", "-c",
+        // Try airport first (works on older macOS)
+        let airportProc = Process()
+        airportProc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        airportProc.arguments = ["bash", "-c",
             "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -I 2>/dev/null | awk '/channel:/{print $2}' | head -1"]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = FileHandle.nullDevice
-        try? proc.run(); proc.waitUntilExit()
-        let raw = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+        let airportPipe = Pipe()
+        airportProc.standardOutput = airportPipe
+        airportProc.standardError  = FileHandle.nullDevice
+        try? airportProc.run(); airportProc.waitUntilExit()
+        let raw = String(data: airportPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
                       .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        // airport reports "6,+1" style — take only the number before comma
         let chStr = raw.split(separator: ",").first.flatMap(String.init) ?? raw
         if let ch = Int(chStr), ch >= 1, ch <= 14 {
             let mhz = 2407 + ch * 5
-            log("📻 Detected channel \(ch) = \(mhz) MHz", color: CLR_CYN)
+            log("📻 Detected channel \(ch) = \(mhz) MHz (airport)", color: CLR_CYN)
             return mhz
         }
-        log("📻 Using default channel 6 (2437 MHz)", color: CLR_YLW)
+
+        // Fallback: system_profiler (Ventura+) — parse first 2.4GHz channel found.
+        // The glasses are 2.4GHz-only hardware; even if Mac is on 5GHz the AP
+        // usually has a 2.4GHz band on the same SSID.
+        let spProc = Process()
+        spProc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        spProc.arguments = ["bash", "-c",
+            "system_profiler SPAirPortDataType 2>/dev/null | grep 'Channel:.*2GHz' | head -1 | sed 's/.*Channel: \\([0-9]*\\).*/\\1/'"]
+        let spPipe = Pipe()
+        spProc.standardOutput = spPipe
+        spProc.standardError  = FileHandle.nullDevice
+        try? spProc.run(); spProc.waitUntilExit()
+        let spOut = String(data: spPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if let ch = Int(spOut), ch >= 1, ch <= 14 {
+            let mhz = 2407 + ch * 5
+            log("📻 Detected 2.4GHz channel \(ch) = \(mhz) MHz (system_profiler)", color: CLR_CYN)
+            return mhz
+        }
+
+        log("📻 Defaulting to 2.4GHz ch6 (2437 MHz) — airport/system_profiler unavailable", color: CLR_YLW)
         return 2437
     }
 
@@ -1429,29 +1452,60 @@ struct GlassesConfig {
     }
 }
 
+
+// ── Last-used device registry ─────────────────────────────────────────────────
+// Persists the most-recently connected addresses to ~/.glasses-last (one per line).
+// On next run the scan is skipped if the last-used device is already paired.
+
+func lastUsedPath() -> String {
+    (ProcessInfo.processInfo.environment["HOME"] ?? "/tmp") + "/.glasses-last"
+}
+
+func loadLastUsed() -> [String] {
+    guard let txt = try? String(contentsOfFile: lastUsedPath(), encoding: .utf8) else { return [] }
+    return txt.components(separatedBy: .newlines)
+              .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+              .filter { !$0.isEmpty }
+}
+
+func saveLastUsed(_ addr: String) {
+    let norm = addr.lowercased()
+    var list = loadLastUsed().filter { $0 != norm }
+    list.insert(norm, at: 0)
+    let out = list.prefix(10).joined(separator: "\n") + "\n"
+    try? out.write(toFile: lastUsedPath(), atomically: true, encoding: .utf8)
+}
+
 // ── Auto-discover paired SmartEyeglass ───────────────────────────────────────
 func scanAndSelectGlasses() -> String? {
-    log("🔍 Scanning for SmartEyeglass... (10s — power on glasses now)", color: CLR_CYN)
+    let lastUsed = loadLastUsed()
+    let allPaired = (IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice]) ?? []
+    let pairedGlasses = allPaired.filter { ($0.name ?? "").lowercased().contains("smarteyeglass") }
 
-    var found: [IOBluetoothDevice] = []
-    var seen  = Set<String>()
-
-    // Seed with already-paired SmartEyeglass (show immediately)
-    let pairedAddrs: Set<String>
-    if let paired = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] {
-        let glasses = paired.filter { ($0.name ?? "").lowercased().contains("smarteyeglass") }
-        for d in glasses {
-            let addr = d.addressString ?? ""
-            seen.insert(addr)
-            found.append(d)
-            log("  ★ \(d.name ?? "?")  [\(addr)]  (paired)", color: CLR_MAG)
+    // Fast path: last-used address is already in paired list — skip scan entirely
+    for addr in lastUsed {
+        if let d = pairedGlasses.first(where: { $0.addressString?.lowercased() == addr }) {
+            log("✅ Last-used \(d.name ?? "SmartEyeglass") [\(d.addressString ?? "?")] (from history — skipping scan)", color: CLR_GRN)
+            return d.addressString
         }
-        pairedAddrs = Set(glasses.compactMap { $0.addressString })
-    } else {
-        pairedAddrs = []
     }
 
-    // Live scan
+    // Fast path: exactly one SmartEyeglass paired and none in history — auto-pick
+    if pairedGlasses.count == 1 && lastUsed.isEmpty {
+        let d = pairedGlasses[0]
+        log("✅ Only paired SmartEyeglass: \(d.name ?? "?") [\(d.addressString ?? "?")] — auto-connecting", color: CLR_GRN)
+        return d.addressString
+    }
+
+    // Need to scan
+    log("🔍 Scanning for SmartEyeglass... (8s — power on glasses now)", color: CLR_CYN)
+    for d in pairedGlasses {
+        log("  ★ \(d.name ?? "?")  [\(d.addressString ?? "")]  (paired)", color: CLR_MAG)
+    }
+
+    var found: [IOBluetoothDevice] = pairedGlasses
+    var seen = Set(pairedGlasses.compactMap { $0.addressString?.lowercased() })
+
     let inquiry = IOBluetoothDeviceInquiry(delegate: nil)!
     inquiry.inquiryLength = 8
     inquiry.start()
@@ -1462,18 +1516,14 @@ func scanAndSelectGlasses() -> String? {
         RunLoop.current.run(until: Date().addingTimeInterval(0.5))
         dots += 1
         if dots % 2 == 0 { print(".", terminator: ""); fflush(stdout) }
-
         if let devices = inquiry.foundDevices() as? [IOBluetoothDevice] {
             for d in devices {
-                let addr = d.addressString ?? ""
+                let addr = d.addressString?.lowercased() ?? ""
                 guard !seen.contains(addr) else { continue }
                 seen.insert(addr)
-                let name = d.name ?? ""
-                if name.lowercased().contains("smarteyeglass") {
+                if (d.name ?? "").lowercased().contains("smarteyeglass") {
                     found.append(d)
-                    let tag = pairedAddrs.contains(addr) ? "paired" : "🔵 new"
-                    print("")
-                    log("  + \(name)  [\(addr)]  (\(tag))", color: CLR_GRN)
+                    print(""); log("  + \(d.name ?? "?")  [\(d.addressString ?? "")]  (found)", color: CLR_GRN)
                 }
             }
         }
@@ -1481,38 +1531,62 @@ func scanAndSelectGlasses() -> String? {
     inquiry.stop()
     print("")
 
-    guard !found.isEmpty else {
+    // No SmartEyeglass found — intelligent suggestion by Sony MAC OUI
+    if found.isEmpty {
+        let sonyOUI = ["ac:9b:0a", "20:16:d8", "e0:f0:10"]
+        let scanned = (inquiry.foundDevices() as? [IOBluetoothDevice]) ?? []
+        let suggestions = (allPaired + scanned).filter { d in
+            let addr = d.addressString?.lowercased() ?? ""
+            return sonyOUI.contains(where: { addr.hasPrefix($0) })
+        }
         log("❌ No SmartEyeglass found.", color: CLR_RED)
         log("   → Hold power switch 4+ sec to power on", color: CLR_YLW)
-        log("   → If new device: pair first via System Settings → Bluetooth", color: CLR_YLW)
-        log("   → Or: ./glasses-tool connect <address>  to connect directly (triggers pairing)", color: CLR_YLW)
+        log("   → Pair first: System Settings → Bluetooth", color: CLR_YLW)
+        log("   → Or: ./glasses-tool connect <address>", color: CLR_YLW)
+        if !suggestions.isEmpty {
+            log("   → Possible match by Sony manufacturer ID:", color: CLR_CYN)
+            for d in suggestions {
+                log("       \(d.name ?? "(unknown)")  [\(d.addressString ?? "?")]", color: CLR_CYN)
+            }
+        }
         return nil
     }
 
+    // After scan: if a last-used address showed up, use it
+    for addr in lastUsed {
+        if let d = found.first(where: { $0.addressString?.lowercased() == addr }) {
+            log("✅ Last-used \(d.name ?? "?") [\(d.addressString ?? "?")] (matched after scan)", color: CLR_GRN)
+            return d.addressString
+        }
+    }
+
+    // Exactly one candidate
     if found.count == 1 {
         let d = found[0]
         log("✅ Connecting to \(d.name ?? "?") [\(d.addressString ?? "?")]", color: CLR_GRN)
         return d.addressString
     }
 
-    // Multiple — let user pick
-    print("")
-    log("Found \(found.count) glasses:", color: CLR_CYN)
-    let pairedList = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] ?? []
-    for (i, d) in found.enumerated() {
-        let addr  = d.addressString ?? ""
-        let isPaired = pairedList.contains { $0.addressString == addr }
-        let tag  = isPaired ? "\(CLR_MAG)(paired)\(CLR_RST)" : "\(CLR_GRN)(new — will pair)\(CLR_RST)"
-        log("  [\(i+1)] \(d.name ?? "?")  [\(addr)]  \(tag)", color: CLR_CYN)
+    // Multiple: sort last-used first, show with recommendation
+    let sorted = found.sorted { a, b in
+        let ai = lastUsed.firstIndex(of: a.addressString?.lowercased() ?? "") ?? Int.max
+        let bi = lastUsed.firstIndex(of: b.addressString?.lowercased() ?? "") ?? Int.max
+        return ai < bi
     }
-    print("\(CLR_YLW)Select [1-\(found.count)] (Enter = 1): \(CLR_RST)", terminator: "")
+    log("Found \(sorted.count) SmartEyeglass devices:", color: CLR_CYN)
+    for (i, d) in sorted.enumerated() {
+        let addr = d.addressString?.lowercased() ?? ""
+        let tag  = lastUsed.contains(addr) ? CLR_GRN + " ← last used" + CLR_RST : ""
+        log("  [\(i+1)] \(d.name ?? "?")  [\(d.addressString ?? "?")]\(tag)", color: CLR_CYN)
+    }
+    print("\(CLR_YLW)Select [1-\(sorted.count)] (Enter = 1, recommended): \(CLR_RST)", terminator: "")
     fflush(stdout)
     if let line = readLine(),
        let n = Int(line.trimmingCharacters(in: .whitespaces)),
-       n >= 1, n <= found.count {
-        return found[n-1].addressString
+       n >= 1, n <= sorted.count {
+        return sorted[n-1].addressString
     }
-    return found[0].addressString
+    return sorted[0].addressString
 }
 
 let config = GlassesConfig.load()
