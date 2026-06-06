@@ -59,6 +59,13 @@ func log(_ msg: String, color: String = CLR_RST) {
     let ts = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
     print("\(color)[\(ts)] \(msg)\(CLR_RST)")
     fflush(stdout)
+    let level: String
+    switch color {
+    case CLR_RED: level = "ERROR"
+    case CLR_YLW: level = "WARN"
+    default:      level = "INFO"
+    }
+    emitEvent("LOG", ["level": level, "msg": msg])
 }
 
 // ── Hex helpers ───────────────────────────────────────────────────────────────
@@ -130,6 +137,42 @@ class CaptureLog {
         queue.sync { fh?.closeFile() }
         log("Capture saved: \(byteCount) bytes total → \(path)", color: CLR_YLW)
     }
+}
+
+// ── JSON Event Log ──────────────────────────────────────────────────────────────
+class JSONEventLog {
+    let path: String
+    private var fh: FileHandle?
+    private let queue = DispatchQueue(label: "glasses.jsonlog", qos: .utility)
+
+    init(path: String) {
+        self.path = path
+        FileManager.default.createFile(atPath: path, contents: nil)
+        fh = FileHandle(forWritingAtPath: path)
+    }
+
+    func write(_ fields: [String: Any]) {
+        let ts = Date().timeIntervalSince1970 * 1000.0
+        var obj = fields
+        obj["ts"] = ts
+        queue.async { [weak self] in
+            guard let self = self, let fh = self.fh else { return }
+            if let data = try? JSONSerialization.data(withJSONObject: obj) {
+                fh.write(data)
+                fh.write(Data("\n".utf8))
+            }
+        }
+    }
+
+    func close() {
+        queue.sync { fh?.closeFile() }
+    }
+}
+
+func emitEvent(_ type: String, _ extra: [String: Any] = [:]) {
+    var fields = extra
+    fields["type"] = type
+    gJSONLog?.write(fields)
 }
 
 // ── RFCOMM delegate ───────────────────────────────────────────────────────────
@@ -246,6 +289,7 @@ func cmdSDP(address: String) {
 
 // ── Global references ─────────────────────────────────────────────────────────
 var gChannel: IOBluetoothRFCOMMChannel?
+var gJSONLog: JSONEventLog?
 var gDelegate: RFCOMMDelegate?
 var gCapture: CaptureLog?
 let gWriteQueue = DispatchQueue(label: "glasses.rfcomm.write", qos: .userInitiated)
@@ -263,6 +307,7 @@ func cmdConnect(address: String, channel: BluetoothRFCOMMChannelID = 0,
 
     let name = device.name ?? address
     log("Connecting to \(name) [\(address)]...", color: CLR_CYN)
+    gJSONLog = JSONEventLog(path: "/tmp/glasses-events.jsonl")
 
     device.performSDPQuery(nil)
     RunLoop.current.run(until: Date().addingTimeInterval(4))
@@ -302,9 +347,17 @@ func cmdConnect(address: String, channel: BluetoothRFCOMMChannelID = 0,
     var wifiPort   = 0         // OS-assigned TCP port for ServerSocket
     var wifiServerFd: Int32 = -1
     var wifiClientFd: Int32 = -1
-    var wifiSSID   = "DIRECT-ma-SonyGlasses"
-    var wifiPass   = "SonyGlass2024!"
-    var wifiGoIP   = "192.168.2.1"   // macOS bridge100 IP (Internet Sharing default)
+    var wifiSSID   = ""   // populated from .env SSID=
+
+    // ── emitState helper ──────────────────────────────────────────────────────
+    func emitState() {
+        emitEvent("STATE", [
+            "phase": initPhase, "wifi_phase": wifiPhase, "wifi_active": wifiActive,
+            "tcp_connected": wifiClientFd >= 0, "bt_connected": gChannel != nil
+        ])
+    }
+    var wifiPass   = ""   // populated from .env PSWD=
+    var wifiGoIP   = ""   // macOS WiFi IP (en0); populated at connect time
     let wifiWriteQueue = DispatchQueue(label: "glasses.wifi.write", qos: .userInitiated)
 
     // ── Send over BT RFCOMM (chunked to MTU) ──────────────────────────────────
@@ -326,6 +379,9 @@ func cmdConnect(address: String, channel: BluetoothRFCOMMChannelID = 0,
             }
             let preview = bytes.prefix(12).map{String(format:"%02x",$0)}.joined(separator:" ")
             log("→ BT TX \(label) \(bytes.count)B \(ok ? "OK" : "FAIL"): \(preview)...", color: CLR_BLU)
+            let cmdHex = bytes.isEmpty ? "0x00" : String(format: "0x%02x", bytes[0])
+            emitEvent("TX", ["cmd": cmdHex, "name": label, "bytes": bytes.count,
+                             "phase": initPhase, "wifi_active": wifiActive, "ok": ok])
         }
         gCapture?.write(direction: " TX(BT)", data: Data(bytes))
     }
@@ -346,6 +402,9 @@ func cmdConnect(address: String, channel: BluetoothRFCOMMChannelID = 0,
             } else {
                 log("⚠️ WiFi TX partial \(written)/\(bytes.count): \(label)", color: CLR_RED)
             }
+            let cmdHexW = bytes.isEmpty ? "0x00" : String(format: "0x%02x", bytes[0])
+            emitEvent("TX", ["cmd": cmdHexW, "name": label, "bytes": bytes.count,
+                             "phase": initPhase, "wifi_active": true, "ok": written == bytes.count])
         }
         gCapture?.write(direction: " TX(WiFi)", data: Data(bytes))
     }
@@ -415,6 +474,7 @@ func cmdConnect(address: String, channel: BluetoothRFCOMMChannelID = 0,
                 log("✅ Glasses TCP connected! fd=\(clientFd)", color: CLR_GRN)
                 log("   Type 'wifi switch' to activate WiFi data path.", color: CLR_YLW)
                 wifiPhase = 12
+                emitState()
             }
 
             // Read loop — feed to same protocol handler as BT
@@ -435,6 +495,8 @@ func cmdConnect(address: String, channel: BluetoothRFCOMMChannelID = 0,
             DispatchQueue.main.async {
                 if wifiActive {
                     wifiActive = false; wifiPhase = 0
+                    emitEvent("WIFI", ["event": "DROPPED", "state": 0])
+                    emitState()
                     log("⬅️ WiFi dropped — BT is now active for all commands.", color: CLR_YLW)
                 }
             }
@@ -474,7 +536,7 @@ print(psk.hex())
     //   0x20-0x3F: passphrase (32B, UTF-8, null-padded)
     //   0x40-0x5F: reserved zeros (32B)
     //   0x60-0x63: goAddr (4B, IPv4, big-endian)
-    //   0x64-0x67: staAddr (4B, IPv4 — glasses' suggested IP)
+    //   0x64-0x67: staAddr (4B, IPv4 — 0.0.0.0 on same-network WiFi, glasses use DHCP)
     //   0x68-0x6B: subnetMask (4B, big-endian)
     //   0x6C-0x6F: dnsServer (4B, zeros)
     //   0x70-0x73: gateway (4B, zeros)
@@ -503,10 +565,9 @@ print(psk.hex())
         // goAddr at 0x60
         for i in 0..<4 { payload[0x60 + i] = octets[i] }
 
-        // staAddr at 0x64 — derive by flipping last octet (e.g. .1 → .2)
-        var sta = octets
-        sta[3] = (octets[3] == 1) ? 2 : 1
-        for i in 0..<4 { payload[0x64 + i] = sta[i] }
+        // staAddr at 0x64 — set to 0.0.0.0 on same-network WiFi; glasses use router DHCP
+        // (WiFi Direct P2P: was flip last octet to assign glasses a static IP from Mac's DHCP)
+        for i in 0..<4 { payload[0x64 + i] = 0 }
 
         // Subnet 255.255.255.0 at 0x68
         payload[0x68] = 255; payload[0x69] = 255; payload[0x6A] = 255; payload[0x6B] = 0
@@ -554,30 +615,26 @@ print(psk.hex())
         return 2437
     }
 
-    // ── Detect macOS hotspot IP (bridge100 = Internet Sharing default) ─────────
-    func detectHotspotIP() {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        proc.arguments = ["bash", "-c",
-            "ipconfig getifaddr bridge100 2>/dev/null || ipconfig getifaddr en0 2>/dev/null || echo ''"]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = FileHandle.nullDevice
-        try? proc.run(); proc.waitUntilExit()
-        let ip = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !ip.isEmpty && ip.contains(".") {
+    // ── Detect macOS WiFi IP (en0 — same network the glasses will join) ─────────
+    func detectWifiIP() {
+        let ip = getInterfaceIP("en0") ?? ""
+        if !ip.isEmpty {
             wifiGoIP = ip
-            log("✅ Hotspot IP: \(ip)  (saved to wifiGoIP)", color: CLR_GRN)
+            log("✅ WiFi IP (en0): \(ip)  (saved to wifiGoIP)", color: CLR_GRN)
         } else {
-            log("⚠️ Could not detect hotspot IP. Is Internet Sharing enabled?", color: CLR_YLW)
-            log("   Check: System Settings → General → Sharing → Internet Sharing", color: CLR_YLW)
-            log("   Then: ifconfig bridge100", color: CLR_YLW)
+            log("⚠️ Could not detect en0 IP. Are you connected to WiFi?", color: CLR_YLW)
+            log("   Run: ipconfig getifaddr en0", color: CLR_YLW)
         }
     }
 
     // ── Start WiFi connect sequence ────────────────────────────────────────────
     func wifiStartConnect(ssid: String, pass: String, goIP: String) {
+        let resolvedIP = goIP.isEmpty ? (getInterfaceIP("en0") ?? "") : goIP
+        guard !resolvedIP.isEmpty else {
+            log("❌ Cannot determine Mac WiFi IP. Run: ipconfig getifaddr en0", color: CLR_RED)
+            return
+        }
+        if wifiGoIP.isEmpty { wifiGoIP = resolvedIP }
         // 1. Create TCP ServerSocket first (glasses must find port to connect to)
         let port = wifiCreateServer()
         guard port > 0 else { return }
@@ -598,10 +655,11 @@ print(psk.hex())
 
         // 5. Build and send WifiConnectReq over BT
         let req = buildWifiConnectReq(ssid: ssid, passphrase: pass, psk: psk,
-                                       goIP: goIP, port: port, channelMHz: channelMHz)
+                                       goIP: resolvedIP, port: port, channelMHz: channelMHz)
         guard !req.isEmpty else { return }
         sendCmd(req, label: "WifiConnectReq(0x94)")
         wifiPhase = 11
+        emitState()
 
         log("", color: CLR_RST)
         log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", color: CLR_CYN)
@@ -630,14 +688,14 @@ print(psk.hex())
         \(CLR_GRN)wifi switch\(CLR_RST)                     switch display path to WiFi (0x96 mode=1)
         \(CLR_GRN)wifi bt\(CLR_RST)                         switch back to BT (0x96 mode=0)
         \(CLR_GRN)wifi off\(CLR_RST)                        disable glasses WiFi (0x93)
-        \(CLR_GRN)wifi ip\(CLR_RST)                         detect macOS hotspot IP (bridge100)
+        \(CLR_GRN)wifi ip\(CLR_RST)                         detect macOS WiFi IP (en0)
 
         \(CLR_YLW)SETUP (before 'wifi connect'):\(CLR_RST)
-          System Settings → General → Sharing → Internet Sharing
-            Share from: USB Ethernet or Thunderbolt Ethernet
-            To: Wi-Fi
-            WiFi Options → SSID: \(wifiSSID)  Password: \(wifiPass)
-          Enable Internet Sharing, then verify: ifconfig bridge100
+          1. Connect THIS Mac to the same WiFi network the glasses will join
+          2. Put credentials in macos-middleware/.env:
+               SSID=YourNetwork
+               PSWD=YourPassword
+          3. Verify Mac is on WiFi: ipconfig getifaddr en0
 
         \(CLR_CYN)Current config:\(CLR_RST)
           SSID:     \(wifiSSID)
@@ -763,6 +821,7 @@ print(psk.hex())
 
     // DEFLATE compress — native zlib, raw wbits=-15 (Java Deflater nowrap=true equivalent)
     func deflateCompress(_ input: [UInt8]) -> [UInt8] {
+        let t0 = Date().timeIntervalSince1970 * 1000.0
         var strm = z_stream()
         let rc = deflateInit2_(&strm, Z_BEST_COMPRESSION, Z_DEFLATED, -15, 9,
                                Z_DEFAULT_STRATEGY, ZLIB_VERSION,
@@ -781,7 +840,12 @@ print(psk.hex())
             strm.avail_out = UInt32(bufSize)
             _ = deflate(&strm, Z_FINISH)
         }
-        return Array(buf[0..<Int(strm.total_out)])
+        let result = Array(buf[0..<Int(strm.total_out)])
+        let ms = Int(Date().timeIntervalSince1970 * 1000.0 - t0)
+        let ratio = input.isEmpty ? 0.0 : Double(result.count) / Double(input.count)
+        emitEvent("COMPRESS", ["raw": input.count, "compressed": result.count,
+                               "ratio": ratio, "ms": ms])
+        return result
     }
 
     // ── REPL help ─────────────────────────────────────────────────────────────
@@ -893,10 +957,12 @@ print(psk.hex())
             case "on":
                 sendCmd([0x92, 0x00, 0x00], label: "WifiStatusTurnOnReq")
                 wifiPhase = 10
+                emitState()
                 log("📶 Sent WifiTurnOnReq (0x92). Waiting for 0x91 ENABLED...", color: CLR_YLW)
             case "off":
                 sendCmd([0x93, 0x00, 0x00], label: "WifiStatusTurnOffReq")
                 wifiPhase = 0; wifiActive = false
+                emitState()
             case "status":
                 sendCmd([0x90, 0x00, 0x00], label: "WifiStatusReq")
             case "connect":
@@ -905,13 +971,13 @@ print(psk.hex())
                 if parts.count > 2 && String(parts[2]) == "auto" {
                     let ssid = config.wifiSSID.isEmpty ? wifiSSID : config.wifiSSID
                     let pass = config.wifiPSWD.isEmpty ? wifiPass : config.wifiPSWD
-                    let ip   = getInterfaceIP("en0") ?? getInterfaceIP("bridge100") ?? ""
+                    let ip   = getInterfaceIP("en0") ?? ""
                     guard !ssid.isEmpty, !pass.isEmpty else {
                         log("⚠️  No SSID/PSWD in .env. Use: wifi connect <ssid> <pass> <ip>", color: CLR_RED)
                         break
                     }
                     guard !ip.isEmpty else {
-                        log("⚠️  Could not detect en0/bridge100 IP.", color: CLR_RED)
+                        log("⚠️  Could not detect en0 IP. Are you on WiFi?", color: CLR_RED)
                         log("   Run: ipconfig getifaddr en0", color: CLR_YLW)
                         log("   Then: wifi connect \(ssid) \(pass) <your-ip>", color: CLR_YLW)
                         break
@@ -936,7 +1002,7 @@ print(psk.hex())
                 wifiActive = false; wifiPhase = 0
                 log("⬅️ Switched back to BT data path.", color: CLR_YLW)
             case "ip":
-                detectHotspotIP()
+                detectWifiIP()
                 print("\(CLR_MAG)> \(CLR_RST)", terminator: ""); fflush(stdout); return
             case "setup":
                 printWifiSetup(); return
@@ -1056,21 +1122,37 @@ print(psk.hex())
         guard data.count >= 3 else { return }
         let cmdId = data[0]
 
+        // Emit RX event for every incoming command
+        let rxNames: [UInt8: String] = [
+            0x01: "ACK", 0x02: "NAK", 0x05: "PING", 0x06: "LevelNotification",
+            0x08: "VersionResponse", 0x0a: "ProtocolVersion", 0x72: "SettingsStatusResponse",
+            0x81: "FotaStatus", 0x91: "WifiStatusRes", 0x95: "WifiConnectivityStatus",
+            0x96: "WifiDPSwitchPathReq", 0x97: "WifiDPSwitchPathRes",
+            0xe5: "LayoutEventNotify", 0xe8: "ImageAck", 0xff: "SyncResponse"
+        ]
+        let rxCmdHex = String(format: "0x%02x", cmdId)
+        let rxCmdName = rxNames[cmdId] ?? rxCmdHex
+        let rxPayload = data.count > 3 ? data[3...].prefix(8).map{String(format:"%02x",$0)}.joined() : ""
+        emitEvent("RX", ["cmd": rxCmdHex, "name": rxCmdName, "payload": rxPayload, "phase": initPhase])
+
         switch (initPhase, cmdId) {
 
         // ── BT handshake ──────────────────────────────────────────────────────
         case (0, 0x0a):
             initPhase = 1
+            emitState()
             log("✨ P1: ProtocolVersion. Sending SettingsStatusRequest...", color: CLR_MAG)
             sendCmd([0x71, 0x00, 0x00], label: "SettingsStatusRequest")
 
         case (1, 0x72):
             initPhase = 2
+            emitState()
             log("✨ P2: SettingsStatusResponse. Sending VersionRequest...", color: CLR_MAG)
             sendCmd([0x07, 0x00, 0x01, 0x01], label: "VersionRequest")
 
         case (2, 0x08):
             initPhase = 3
+            emitState()
             let ver = data.count > 3 ? (String(bytes: Array(data[3...]), encoding: .ascii) ?? "?") : "?"
             log("✨ P3: FW=\(ver). Sending NewHostApp...", color: CLR_MAG)
             sendCmd([0x85, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00], label: "NewHostApp(0)")
@@ -1086,6 +1168,7 @@ print(psk.hex())
             log("✨ P3: FotaStatus. Sending SyncResponse (critical!)...", color: CLR_MAG)
             sendCmd([0xff, 0x00, 0x00], label: "SyncResponse")
             initPhase = 4
+            emitState()
             log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", color: CLR_YLW)
             log("👓 Tap the touch sensor OR type 'help' for commands.", color: CLR_YLW)
             log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", color: CLR_YLW)
@@ -1096,6 +1179,7 @@ print(psk.hex())
         case (4, 0x31):
             log("🎉 P4→5: OpenAppStartResponse! Glasses confirmed!", color: CLR_GRN)
             initPhase = 5
+            emitState()
             sendCmd([0xe0,0x00,0x0a,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00],
                     label: "LayoutInit(0,0,state=0)")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -1109,6 +1193,7 @@ print(psk.hex())
             let level = data.count > 3 ? data[3] : 0
             log("🎉 P4→5: LevelNotification(level=\(level))! Glasses READY!", color: CLR_GRN)
             initPhase = 5
+            emitState()
             sendCmd([0x30, 0x00, 0x00], label: "OpenAppStartRequest")
             sendCmd([0xe0,0x00,0x0a,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00],
                     label: "LayoutInit(0,0,state=0)")
@@ -1138,6 +1223,8 @@ print(psk.hex())
             if status == 3 && wifiPhase == 10 {
                 log("✅ Glasses WiFi ENABLED. Type 'wifi connect' to proceed.", color: CLR_GRN)
                 wifiPhase = 11
+                emitEvent("WIFI", ["event": "ENABLED", "state": Int(status)])
+                emitState()
             }
 
         case (_, 0x95): // WifiConnectivityStatus
@@ -1149,6 +1236,8 @@ print(psk.hex())
             if status == 3 {
                 log("✅ Glasses joined WiFi! Waiting for TCP connection on port \(wifiPort)...", color: CLR_GRN)
                 log("   (TCP accept is already running in background)", color: CLR_YLW)
+                emitEvent("WIFI", ["event": "CONNECTED", "state": Int(status)])
+                emitState()
             }
 
         case (_, 0x97): // WifiDPSwitchPathRes
@@ -1156,6 +1245,8 @@ print(psk.hex())
             log("🔀 WifiDPSwitchPathRes(0x97): path=\(path == 1 ? "WIFI" : "BT")", color: CLR_GRN)
             if path == 1 {
                 wifiActive = true; wifiPhase = 13
+                emitEvent("WIFI", ["event": "SWITCHED", "state": 13])
+                emitState()
                 log("🚀 WiFi data path ACTIVE — switching to 30fps glider demo!", color: CLR_GRN)
                 golTimer?.invalidate(); golTimer = nil
                 golInit()
@@ -1177,6 +1268,7 @@ print(psk.hex())
                 log("🎮 30fps glider loop running over WiFi. Type 'stop' to stop.", color: CLR_MAG)
             } else {
                 wifiActive = false; wifiPhase = 0
+                emitState()
                 log("⬅️ Data path back to BT.", color: CLR_YLW)
             }
 

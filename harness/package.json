@@ -1,0 +1,19 @@
+{
+  "name": "glasses-harness",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "node --loader ts-node/esm src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@earendil-works/pi-tui": "file:/Users/gerhardgustav/.pi/agent/npm/node_modules/@earendil-works/pi-tui",
+    "chalk": "^5.3.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.0"
+  }
+}

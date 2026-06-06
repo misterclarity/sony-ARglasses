@@ -1,3 +1,6 @@
+# Dev scratch / research (gitignored, stays local)
+_dev/
+
 # Build artifacts
 build/
 .gradle/
@@ -23,6 +26,13 @@ Sony/
 # Compiled binary
 macos-middleware/glasses-tool
 
+# User config (copy from glasses.conf.example)
+macos-middleware/glasses.conf
+
+# Harness build artifacts
+harness/dist/
+harness/node_modules/
+
 # Secrets
 .env
 
@@ -34,3 +44,6 @@ macos-middleware/glasses-tool
 /tmp/
 __pycache__/
 progress.md
+
+# Session monitor
+.monitor/

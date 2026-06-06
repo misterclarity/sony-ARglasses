@@ -1,98 +1,78 @@
 #!/bin/bash
-# glasses-wifi-setup.sh — Sony SED-E1 WiFi hotspot setup
-# Usage: sudo ./glasses-wifi-setup.sh [start|stop|status]
-# Requires sudo — writes /Library/Preferences/SystemConfiguration/com.apple.nat.plist
+# glasses-wifi-setup.sh — Sony SED-E1 WiFi readiness check
+#
+# Verifies that Mac and glasses are configured to use the same WiFi network.
+# Both devices must be on the same AP — no Internet Sharing or hotspot needed.
+#
+# Usage: ./glasses-wifi-setup.sh [check|env]
 
-SSID="DIRECT-ma-SonyGlasses"
-PASSWORD="sony1234"
-WIFI_UUID="19ABF24D-BA16-4A82-B6AE-37EC82632230"   # Wi-Fi (en0) on this Mac
-NAT_PLIST="/Library/Preferences/SystemConfiguration/com.apple.nat.plist"
+set -euo pipefail
+REPO="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="$REPO/macos-middleware/.env"
 
-if [[ $EUID -ne 0 ]]; then
-    echo "❌  Run with sudo: sudo $0 ${1:-start}"
-    exit 1
-fi
+case "${1:-check}" in
+check)
+    echo "═══ SED-E1 WiFi readiness check ═══"
+    echo ""
 
-case "${1:-start}" in
-start)
-    echo "📡  Writing hotspot config: SSID=$SSID  pass=$PASSWORD"
-    cat > "$NAT_PLIST" << PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>NAT</key>
-    <dict>
-        <key>AirPort</key>
-        <dict>
-            <key>SharingNetworkName</key>
-            <string>$SSID</string>
-            <key>SharingNetworkPassword</key>
-            <string>$PASSWORD</string>
-        </dict>
-        <key>Enabled</key>
-        <integer>1</integer>
-        <key>PrimaryService</key>
-        <string>$WIFI_UUID</string>
-        <key>SharingDevices</key>
-        <array>
-            <string>$WIFI_UUID</string>
-        </array>
-        <key>SharingNetworkNumberStart</key>
-        <string>192.168.2.1</string>
-        <key>SharingNetworkMask</key>
-        <string>255.255.255.0</string>
-    </dict>
-</dict>
-</plist>
-PLIST
+    # 1. en0 IP
+    EN0_IP=$(ipconfig getifaddr en0 2>/dev/null || true)
+    if [ -n "$EN0_IP" ]; then
+        echo "✅ Mac WiFi IP (en0):   $EN0_IP"
+    else
+        echo "❌ en0 has no IP — connect Mac to WiFi first"
+        exit 1
+    fi
 
-    echo "🔄  Restarting Internet Sharing daemon..."
-    launchctl kickstart -k system/com.apple.NetworkSharing 2>/dev/null || \
-        launchctl load -w /System/Library/LaunchDaemons/com.apple.NetworkSharing.plist 2>/dev/null
-
-    echo "⏳  Waiting for bridge100..."
-    for i in $(seq 1 10); do
-        sleep 1
-        IP=$(ipconfig getifaddr bridge100 2>/dev/null)
-        if [[ -n "$IP" ]]; then
-            echo ""
-            echo "✅  Hotspot UP"
-            echo "    SSID    : $SSID"
-            echo "    Password: $PASSWORD"
-            echo "    macOS IP: $IP  (this is your goAddr for wifi connect)"
-            echo ""
-            echo "Next steps:"
-            echo "  1. Run ./glasses-tool  (BT connects, GoL starts)"
-            echo "  2. Type: wifi on"
-            echo "  3. Type: wifi connect $SSID $PASSWORD $IP"
-            echo "  4. Type: wifi switch"
-            exit 0
+    # 2. .env creds
+    if [ -f "$ENV_FILE" ]; then
+        SSID=$(grep '^SSID=' "$ENV_FILE" | cut -d= -f2-)
+        PSWD=$(grep '^PSWD=' "$ENV_FILE" | cut -d= -f2-)
+        if [ -n "$SSID" ] && [ -n "$PSWD" ]; then
+            echo "✅ .env credentials:   SSID=$SSID  PSWD=***"
+        else
+            echo "⚠️  .env exists but SSID or PSWD is empty"
         fi
-        printf "."
-    done
+    else
+        echo "❌ macos-middleware/.env not found"
+        echo "   Create it:"
+        echo "   echo 'SSID=YourNetwork' > macos-middleware/.env"
+        echo "   echo 'PSWD=YourPassword' >> macos-middleware/.env"
+        exit 1
+    fi
+
+    # 3. Connected SSID
+    CURRENT_SSID=$(networksetup -getairportnetwork en0 2>/dev/null | sed 's/Current Wi-Fi Network: //' || true)
+    if [ -n "$CURRENT_SSID" ]; then
+        echo "✅ Mac connected to:   $CURRENT_SSID"
+        if [ -n "$SSID" ] && [ "$CURRENT_SSID" != "$SSID" ]; then
+            echo "⚠️  Mismatch — .env says '$SSID' but Mac is on '$CURRENT_SSID'"
+            echo "   Either update .env or switch Mac to the '$SSID' network"
+        fi
+    else
+        echo "⚠️  Could not determine current SSID (networksetup)"
+    fi
+
     echo ""
-    echo "⚠️   bridge100 not up after 10s. Check System Settings → Sharing → Internet Sharing."
-    echo "    If the toggle is OFF, turn it ON manually — then re-run this script."
+    echo "When glasses are powered on and you're in the REPL:"
+    echo "  wifi on"
+    echo "  wifi connect auto"
+    echo "  wifi switch"
     ;;
 
-stop)
-    echo "🛑  Stopping Internet Sharing..."
-    launchctl unload /System/Library/LaunchDaemons/com.apple.NetworkSharing.plist 2>/dev/null || true
-    echo "✅  Stopped"
-    ;;
-
-status)
-    IP=$(ipconfig getifaddr bridge100 2>/dev/null || echo "not active")
-    echo "bridge100 : $IP"
-    ifconfig ap1 2>/dev/null | grep -E 'status|ssid' || echo "ap1       : not active"
-    echo ""
-    echo "Connected clients (ARP):"
-    arp -an 2>/dev/null | grep "192.168.2" || echo "  (none yet)"
+env)
+    # Print current .env (mask password)
+    if [ -f "$ENV_FILE" ]; then
+        echo "=== $ENV_FILE ==="
+        sed 's/\(PSWD=\).*/\1***/' "$ENV_FILE"
+    else
+        echo "No .env at $ENV_FILE"
+    fi
     ;;
 
 *)
-    echo "Usage: sudo $0 [start|stop|status]"
-    exit 1
+    echo "Usage: $0 [check|env]"
+    echo "  check  — verify WiFi readiness (default)"
+    echo "  env    — show current .env (passwords masked)"
     ;;
 esac
