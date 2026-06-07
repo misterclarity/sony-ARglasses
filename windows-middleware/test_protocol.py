@@ -91,6 +91,64 @@ def test_wifi_status_enabled_advances_phase():
     s.shutdown()
 
 
+def test_camera_capture_reassembles_jpeg():
+    s = _silent_session()
+    s.init_phase = 5
+    result = {}
+    s.capture_photo(quality=2, resolution=4, on_done=lambda jpeg, info: result.update(jpeg=jpeg, info=info))
+    # Simulate the glasses' reply: Response, two Data packets, Done.
+    fake = b"\xff\xd8" + b"ABCDEFGH" + b"\xff\xd9"   # tiny fake JPEG
+    half = len(fake) // 2
+    resp = bytes([0x00, 0x07]) + len(fake).to_bytes(4, "big") + (0).to_bytes(4, "big")
+    d0 = bytes([0x07]) + (0).to_bytes(2, "big") + fake[:half]
+    d1 = bytes([0x07]) + (1).to_bytes(2, "big") + fake[half:]
+    done = bytes([0x07, 0x00]) + (0).to_bytes(4, "big")
+    with redirect_stdout(io.StringIO()):
+        s.parser.feed(bytes([0xB5, (len(resp) >> 8) & 0xff, len(resp) & 0xff]) + resp)
+        s.parser.feed(bytes([0xB6, (len(d0) >> 8) & 0xff, len(d0) & 0xff]) + d0)
+        s.parser.feed(bytes([0xB6, (len(d1) >> 8) & 0xff, len(d1) & 0xff]) + d1)
+        s.parser.feed(bytes([0xB7, (len(done) >> 8) & 0xff, len(done) & 0xff]) + done)
+    assert result["jpeg"] == fake, result
+    s.shutdown()
+
+
+def test_camera_mode_frame_encoding():
+    # Still-capture sequence: CameraMode -> SensorStart(19) -> CaptureRequest
+    import time
+    s = _silent_session()
+    s.init_phase = 5
+    sent = []
+    s.tp.send = lambda data: sent.append(bytes(data))
+    with redirect_stdout(io.StringIO()):
+        s.capture_photo(quality=2, resolution=4)
+        time.sleep(1.2)                       # let the threaded send sequence run
+    mode = sent[0]
+    assert mode[0] == 0xCE and mode[1:3] == b"\x00\x04"
+    val = int.from_bytes(mode[3:7], "big")
+    assert (val >> 8) & 7 == 4 and (val >> 4) & 3 == 2 and val & 1 == 0   # res, quality, still
+    assert sent[1] == bytes([0x38, 0x00, 0x04, 0x13, 0x06, 0x00, 0x00])  # SensorStart camera=19
+    assert sent[2] == bytes([0xB4, 0x00, 0x00])                          # CaptureRequest
+    s.shutdown()
+
+
+def test_sensor_start_and_parse():
+    import struct
+    s = _silent_session()
+    s.init_phase = 5
+    sent = []
+    s.tp.send = lambda data: sent.append(bytes(data))
+    with redirect_stdout(io.StringIO()):
+        s.start_sensor(g.SENSOR_ACCEL)            # accelerometer, NORMAL rate
+    assert sent[0] == bytes([0x38, 0x00, 0x02, 0x01, 0x03])
+    # Acceleration frame: accuracy(4), timestamp(4), x,y,z float32 BE
+    payload = struct.pack(">iifff", 3, 1000, 0.1, -9.8, 0.5)
+    with redirect_stdout(io.StringIO()):
+        s.parser.feed(bytes([0x3A, (len(payload) >> 8) & 0xff, len(payload) & 0xff]) + payload)
+    x, y, z = s.sensors["accel"]
+    assert abs(x - 0.1) < 1e-3 and abs(y + 9.8) < 1e-3 and abs(z - 0.5) < 1e-3
+    s.shutdown()
+
+
 def test_hex_to_bytes():
     assert g.hex_to_bytes("e9 00 01 01") == bytes([0xe9, 0x00, 0x01, 0x01])
     assert g.hex_to_bytes("0xe900") == bytes([0xe9, 0x00])

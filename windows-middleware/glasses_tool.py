@@ -43,9 +43,17 @@ import hashlib
 import threading
 import subprocess
 import random
+import struct
 import ctypes
 from ctypes import wintypes
 from datetime import datetime
+
+# Motion-sensor IDs (from the SmartEyeglass host APK, Mckinley*SensorConfig)
+SENSOR_ACCEL = 1
+SENSOR_ROTATION = 12
+SENSOR_GYRO = 13
+SENSOR_MAG = 14
+SENSOR_LIGHT = 16
 
 try:
     import winreg
@@ -123,6 +131,10 @@ RX_NAMES = {
     0x3c: "KeyEvent", 0x72: "SettingsStatusResponse", 0x81: "FotaStatus",
     0x91: "WifiStatusRes", 0x95: "WifiConnectivityStatus",
     0x96: "WifiDPSwitchPathReq", 0x97: "WifiDPSwitchPathRes",
+    0xb5: "CameraCaptureResponse", 0xb6: "CameraCaptureData",
+    0xb7: "CameraCaptureDataDone",
+    0x3a: "Acceleration", 0xbc: "Gyro", 0xbd: "Magnetometer",
+    0x3b: "LightSensor", 0x3e: "BatterySensor",
     0xe5: "LayoutEventNotify", 0xe8: "ImageAck", 0xff: "SyncResponse",
 }
 
@@ -708,6 +720,15 @@ class Session:
         self.auto_glider = False  # start the glider automatically on reaching phase 5
         self.auto_wifi = False    # run the full wifi on->connect->switch sequence
 
+        # Camera capture state
+        self._cam = None          # active capture: dict(packets, size, status, id, on_done)
+        self._cam_lock = threading.Lock()
+
+        # Latest motion-sensor values: name -> (x, y, z), plus last-update time + count
+        self.sensors = {}
+        self.sensor_ts = {}
+        self.sensor_count = 0
+
         # Display loop
         self.gol = GameOfLife()
         self._disp_thread = None
@@ -800,6 +821,31 @@ class Session:
             if b0 == 0:
                 self.wifi_active = False
                 self.wifi_phase = 0
+            return
+
+        # Motion-sensor data (accuracy:4, timestamp:4, x,y,z float32 BE)
+        if cmd == 0x3A:
+            self._on_sensor("accel", payload)
+            return
+        if cmd == 0xBC:
+            self._on_sensor("gyro", payload)
+            return
+        if cmd == 0xBD:
+            self._on_sensor("mag", payload)
+            return
+        if cmd == 0x3B:
+            self._on_light(payload)
+            return
+
+        # Camera capture responses (any phase)
+        if cmd == 0xB5:
+            self._on_camera_response(payload)
+            return
+        if cmd == 0xB6:
+            self._on_camera_data(payload)
+            return
+        if cmd == 0xB7:
+            self._on_camera_done(payload)
             return
 
         # BT handshake
@@ -980,6 +1026,130 @@ class Session:
         self.wifi_phase = 11
         log("WifiConnectReq sent. Watch for 0x95 CONNECTED then TCP accept.", CLR_CYN)
         log(f"  SSID={ssid}  IP={go_ip}  port={port}  ch={ch}MHz", CLR_YLW)
+
+    # -- camera capture (protocol from the SmartEyeglass host APK) -----------
+    # JPEG quality: 1=STANDARD 2=FINE 3=SUPERFINE
+    # Resolution: 0=3M 1=SXGA 2=XGA 3=SVGA 4=VGA 5=HVGA 6=QVGA 7=QQVGA
+    def capture_photo(self, quality=2, resolution=4, on_done=None):
+        """Take a still photo. on_done(jpeg_bytes_or_None, info) is called when
+        the transfer finishes. Smaller resolutions transfer faster over BT."""
+        if self.init_phase != 5:
+            log("Camera: not ready (need phase 5).", CLR_RED)
+            if on_done:
+                on_done(None, {"error": "not ready"})
+            return
+        with self._cam_lock:
+            self._cam = {"packets": {}, "size": 0, "status": None,
+                         "id": None, "on_done": on_done, "t0": time.time(),
+                         "quality": quality, "resolution": resolution}
+
+        def _sequence():
+            # Mirrors the host app's still-capture flow:
+            #   cameraModeSet -> startCamera(STILL)=SensorStart(19,6,0) -> cameraCapture
+            # OpenAppCameraMode(0xCE): int32 BE = (fps<<12)|(res<<8)|(quality<<4)|mode
+            val = ((0 & 3) << 12) | ((resolution & 7) << 8) | ((quality & 3) << 4) | 0
+            self.send_cmd([0xCE, 0x00, 0x04] + list(val.to_bytes(4, "big")),
+                          f"OpenAppCameraMode(q={quality},res={resolution},still)")
+            time.sleep(0.2)
+            # OpenAppSensorStart(0x38): sensorId=19(camera), rate=6, interval=0
+            self.send_cmd([0x38, 0x00, 0x04, 0x13, 0x06, 0x00, 0x00],
+                          "OpenAppSensorStart(camera=19)")
+            time.sleep(0.7)   # let the camera warm up
+            self.send_cmd([0xB4, 0x00, 0x00], "OpenAppCameraCaptureRequest")
+            log("Camera: capture requested - waiting for image...", CLR_CYN)
+
+        threading.Thread(target=_sequence, daemon=True).start()
+
+    def _stop_camera_sensor(self):
+        self.send_cmd([0x39, 0x00, 0x01, 0x13], "OpenAppSensorStop(camera=19)")
+
+    # -- motion sensors ------------------------------------------------------
+    # rate: 1=FASTEST 2=GAME 3=NORMAL 4=UI 5=INTERRUPT (6=user interval)
+    def start_sensor(self, sensor_id, rate=3):
+        self.send_cmd([0x38, 0x00, 0x02, sensor_id & 0xFF, rate & 0xFF],
+                      f"OpenAppSensorStart(id={sensor_id},rate={rate})")
+
+    def stop_sensor(self, sensor_id):
+        self.send_cmd([0x39, 0x00, 0x01, sensor_id & 0xFF],
+                      f"OpenAppSensorStop(id={sensor_id})")
+
+    def _on_sensor(self, name, payload):
+        if len(payload) < 20:
+            return
+        nfloats = (len(payload) - 8) // 4
+        vals = struct.unpack(">" + "f" * nfloats, payload[8:8 + nfloats * 4])
+        self.sensors[name] = vals[:3]
+        self.sensor_ts[name] = time.time()
+        self.sensor_count += 1
+        self.jlog.emit("SENSOR", name=name, x=round(vals[0], 3),
+                       y=round(vals[1], 3), z=round(vals[2], 3))
+
+    def _on_light(self, payload):
+        # LightSensor: accuracy(4), timestamp(4), lightValue(int32 BE)
+        if len(payload) < 12:
+            return
+        lux = int.from_bytes(payload[8:12], "big", signed=True)
+        self.sensors["light"] = (lux,)
+        self.sensor_ts["light"] = time.time()
+        self.sensor_count += 1
+        self.jlog.emit("SENSOR", name="light", lux=lux)
+
+    def _on_camera_response(self, payload):
+        if len(payload) < 6:
+            return
+        status = payload[0]
+        image_id = payload[1]
+        size = int.from_bytes(payload[2:6], "big")
+        log(f"Camera: CaptureResponse status={status} id={image_id} size={size}B",
+            CLR_GRN if status == 0 else CLR_RED)
+        self.jlog.emit("CAMERA", event="RESPONSE", status=status, id=image_id, size=size)
+        with self._cam_lock:
+            if self._cam is not None:
+                self._cam["status"] = status
+                self._cam["size"] = size
+                self._cam["id"] = image_id
+        if status != 0:
+            self._finish_camera(ok=False, reason=f"status {status}")
+
+    def _on_camera_data(self, payload):
+        if len(payload) < 3:
+            return
+        pkt = int.from_bytes(payload[1:3], "big")
+        chunk = payload[3:]
+        with self._cam_lock:
+            if self._cam is not None:
+                self._cam["packets"][pkt] = chunk
+
+    def _on_camera_done(self, payload):
+        image_id = payload[0] if payload else 0
+        reason = payload[1] if len(payload) > 1 else 0
+        # Acknowledge receipt (mirrors the host app: single Ack after Done).
+        self.send_cmd([0xF1, 0x00, 0x01, image_id & 0xFF], "CameraCaptureDataAck")
+        log(f"Camera: DataDone id={image_id} reason={reason}", CLR_GRN)
+        self._finish_camera(ok=(reason == 0), reason=f"reason {reason}")
+
+    def _finish_camera(self, ok, reason=""):
+        with self._cam_lock:
+            cam = self._cam
+            self._cam = None
+        if cam is None:
+            return
+        self._stop_camera_sensor()   # stop the camera sensor (mirrors stopCamera)
+        jpeg = b"".join(cam["packets"][k] for k in sorted(cam["packets"]))
+        on_done = cam["on_done"]
+        valid = jpeg[:2] == b"\xff\xd8"
+        if ok and valid:
+            dt = time.time() - cam["t0"]
+            log(f"Camera: got JPEG {len(jpeg)}B in {dt:.1f}s "
+                f"(expected {cam['size']}B).", CLR_GRN)
+            self.jlog.emit("CAMERA", event="DONE", bytes=len(jpeg))
+            if on_done:
+                on_done(jpeg, {"size": cam["size"], "received": len(jpeg)})
+        else:
+            log(f"Camera: capture failed ({reason}); got {len(jpeg)}B, "
+                f"valid_jpeg={valid}", CLR_RED)
+            if on_done:
+                on_done(None, {"error": reason, "received": len(jpeg)})
 
     # -- display loop --------------------------------------------------------
     def _spawn_glider(self):

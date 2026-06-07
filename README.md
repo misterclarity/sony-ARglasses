@@ -94,6 +94,22 @@ The GUI still opens without those extras, but the **one-button connect** (auto h
 
 ---
 
+## Dashboard features (camera, voice, sensors, images)
+
+These were reverse-engineered from the Sony SmartEyeglass host APK (camera/sensor command bytes) and wired into `dashboard.py`. They need the optional extras in `requirements-dashboard.txt` (winsdk, sounddevice, numpy, Pillow, vosk + the Vosk model):
+
+| Button | What it does | Protocol |
+|---|---|---|
+| **Show Image…** | Pick a PNG/JPG/etc; auto-grayscale + fit to 419×138 → display | `0xE7` LayoutPlaceRemove |
+| **Take Photo** | Capture a still JPEG → `glasses-photo.jpg` + preview | `0xCE` mode → `0x38` sensor-start(19) → `0xB4` capture → `0xB5/0xB6/0xB7` |
+| **Voice** | Offline keyword spotting (Vosk) on the glasses mic — say "photo" to capture | mic via HFP; 8k→16k upsample |
+| **Coordinates** | Live accelerometer/gyro/magnetometer/light rendered on the AR display + console | `0x38` SensorStart(id) → data `0x3A`/`0xBC`/`0xBD`/`0x3B` |
+| **Help** | Prints a full capability reference (every sensor, command byte, units) to the console | — |
+
+Camera command IDs: `CameraMode 0xCE`, `CaptureReq 0xB4`, `CaptureResp 0xB5`, `CaptureData 0xB6`, `DataDone 0xB7`, `DataAck 0xF1`. Sensor IDs: accelerometer 1, rotation-vector 12, gyro 13, magnetometer 14, light 16, camera 19. The glasses answer each `SensorStart` with a short burst, so the Coordinates view re-arms stale sensors to keep the readout live.
+
+---
+
 ## REPL (after connect)
 
 ```

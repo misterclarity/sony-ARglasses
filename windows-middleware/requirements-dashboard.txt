@@ -6,3 +6,8 @@
 winsdk>=1.0.0b10
 sounddevice>=0.4.6
 numpy>=1.24
+Pillow>=10.0          # render the captured camera JPEG in the dashboard
+vosk>=0.3.45          # offline speech recognition for the "photo" voice trigger
+# Voice trigger also needs a model in models/vosk-model-small-en-us-0.15/
+#   curl -L -o m.zip https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+#   (unzip into windows-middleware/models/)

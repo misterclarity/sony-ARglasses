@@ -39,5 +39,9 @@ progress.md
 .venv/
 *.jsonl
 *.wav
+glasses-photo*.jpg
+_apkwork/
+*.apk
+windows-middleware/models/
 windows-middleware/glasses.conf
 _dbg.py
